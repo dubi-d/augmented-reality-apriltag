@@ -13,16 +13,8 @@ from duckietown.dtros import DTROS, NodeType
 from sensor_msgs.msg import CompressedImage
 from cv_bridge import CvBridge, CvBridgeError
 
-import rospkg 
+import rospkg
 
-
-"""
-
-This is a template that can be used as a starting point for the CRA1 exercise.
-You need to project the model file in the 'models' directory on an AprilTag.
-To help you with that, we have provided you with the Renderer class that render the obj file.
-
-"""
 
 class ARNode(DTROS):
 
@@ -48,8 +40,12 @@ class ARNode(DTROS):
         self.pub_modified_img = rospy.Publisher(f"~image/compressed", CompressedImage,
                                                 queue_size=1)
 
-        self.log("Letsgoooooo")
+        calibration_data = self.read_yaml_file(f"/data/config/calibrations/camera_intrinsic/{self.veh}.yaml")
+        self.K = np.array(calibration_data["camera_matrix"]["data"]).reshape(3, 3)
+        self.camera_params = (self.K[0, 0], self.K[1, 1], self.K[0, 2], self.K[1, 2])
+        self.tag_size = 0.065
 
+        self.log("Letsgoooooo")
 
     def callback(self, msg):
         img = self.bridge.compressed_imgmsg_to_cv2(msg)  # convert to cv2 img
@@ -57,17 +53,17 @@ class ARNode(DTROS):
 
         # detect april tag and extract its reference frame
         tags = self.at_detector.detect(grayscale_img, estimate_tag_pose=False, camera_params=None, tag_size=None)
-        self.visualize_at_detection(img, tags)
+        #self.visualize_at_detection(img, tags)
 
         # determine H (using apriltag library)
         homography_list = [tag.homography for tag in tags]
 
         # derive P
-        #p_list = [self.projection_matrix(intrinsic=self.intrinsic, homography=H) for H in homography_list]
+        p_list = [self.projection_matrix(self.K, H) for H in homography_list]
 
         # project the model and draw it (using Renderer)
-        #for P in p_list:
-        #    img = self.renderer.render(img, P)
+        for P in p_list:
+            img = self.renderer.render(img, P)
 
         # publish modified image
         img_out = self.bridge.cv2_to_compressed_imgmsg(img)
@@ -75,12 +71,50 @@ class ARNode(DTROS):
         img_out.format = msg.format
         self.pub_modified_img.publish(img_out)
     
-    def projection_matrix(self, intrinsic, homography):
+    def projection_matrix(self, K, H):
         """
-            Write here the compuatation for the projection matrix, namely the matrix
+            Write here the computation for the projection matrix, namely the matrix
             that maps the camera reference frame to the AprilTag reference frame.
         """
-        return None
+        self.log("\n\n -------- projection_matrix --------")
+        self.log(f"K: {type(K)}, shape {K.shape}, \n{K}")
+        self.log(f"H: {type(H)}, shape {H.shape}, \n{H}")
+        R_2d = np.linalg.inv(K).dot(H)  # R_2d = [r1 r2 t]
+        self.log(f"R_2d: shape {R_2d.shape}, \n{R_2d}")
+        R_2d = R_2d / np.linalg.norm(R_2d[:, 0])
+        r1 = R_2d[:, 0]
+        self.log(f"r1: shape {r1.shape}, {r1}")
+        r2 = R_2d[:, 1]
+        self.log(f"r2: shape {r2.shape}, {r2}")
+        t = R_2d[:, 2]
+        self.log(f"t: shape {t.shape}, {t}")
+        r3 = np.cross(r1, r2)
+        self.log(f"r3: shape {r3.shape}, {r3}")
+        #r1, r2, r3 = self.orthogonalize(r1, r2, r3)
+        R_3d = np.column_stack((r1, r2, r3))
+        self.log(f"R_3d before: shape {R_3d.shape}, \n{R_3d}")
+        W, U, Vt = cv2.SVDecomp(R_3d)
+        self.log(f"W: shape {W.shape}, \n{W}")
+        self.log(f"U: shape {U.shape}, \n{U}")
+        self.log(f"Vt: shape {Vt.shape}, \n{Vt}")
+        R_3d = U.dot(Vt)
+        R_3d = np.column_stack((R_3d, t))
+        self.log(f"R_3d after: shape {R_3d.shape}, \n{R_3d}")
+        P = K.dot(R_3d)
+        self.log(f"P: shape {P.shape}, \n{P}")
+        return P
+
+    # ToDo clean up
+    def orthogonalize(self, b1, b2, b3):
+        """
+        Compute an orthonormal base from a given (non-orthonormal) base using the Gram-Schmidt process.
+        """
+        e1 = b1 / np.linalg.norm(b1)
+        e2 = b2 - np.dot(b2, e1) * e1
+        e2 = e2 / np.linalg.norm(e2)
+        e3 = b3 - (np.dot(b3, e1) * e1 + np.dot(b3, e2) * e2)
+        e3 = e3 / np.linalg.norm(e3)
+        return e1, e2, e3
 
     def read_image(self, msg_image):
         """
